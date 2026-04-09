@@ -1,0 +1,622 @@
+"""
+pipeline.py — Four-Pillar Sensory Extraction Pipeline
+Dual-Box OCR Master Clock Architecture
+"""
+
+import cv2
+import os
+import gc
+import json
+import datetime
+import subprocess
+import sys
+import torch
+import numpy as np
+import re
+import difflib
+from pathlib import Path
+from PIL import Image
+from tqdm import tqdm
+
+import config
+
+# ============================================================
+# UTILITIES & CONFIG OVERRIDES
+# ============================================================
+
+# TRIPLE-CHECKED: Hard stop at 21:25 to skip ending credits
+HARD_CUTOFF_SECONDS = 1285.0 
+
+def log(msg: str):
+    now = datetime.datetime.now().strftime("%H:%M:%S")
+    print(f"[{now}] {msg}", flush=True)
+
+def format_time(seconds: float) -> str:
+    td = datetime.timedelta(seconds=max(0.0, seconds))
+    total_seconds = int(td.total_seconds())
+    hours, rem = divmod(total_seconds, 3600)
+    mins, secs = divmod(rem, 60)
+    
+    ms = round((td.total_seconds() - total_seconds) * 1000)
+    if ms >= 1000:
+        ms = 0
+        secs += 1
+    return f"{hours:02}:{mins:02}:{secs:02},{ms:03}"
+
+def flush_gpu():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    gc.collect()
+
+def save_checkpoint(phase: str, data):
+    checkpoint = {}
+    if os.path.exists(config.CHECKPOINT_FILE):
+        try:
+            with open(config.CHECKPOINT_FILE, 'r', encoding='utf-8') as f:
+                checkpoint = json.load(f)
+        except:
+            pass
+    checkpoint[phase] = data
+    with open(config.CHECKPOINT_FILE, 'w', encoding='utf-8') as f:
+        json.dump(checkpoint, f, ensure_ascii=False, indent=2)
+    log(f"Checkpoint saved: {phase}")
+
+def load_checkpoint(phase: str):
+    if os.path.exists(config.CHECKPOINT_FILE):
+        try:
+            with open(config.CHECKPOINT_FILE, 'r', encoding='utf-8') as f:
+                checkpoint = json.load(f)
+            if phase in checkpoint:
+                log(f"Checkpoint found: {phase} — skipping recompute.")
+                return checkpoint[phase]
+        except:
+            pass
+    return None
+
+def extract_audio_wav(video_path: str, output_path: str):
+    cmd = ["ffmpeg", "-i", video_path, "-ar", "16000", "-ac", "1", "-vn"]
+    cmd += ["-t", str(HARD_CUTOFF_SECONDS)]
+    cmd += [output_path, "-y"]
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed:\n{result.stderr.decode(errors='replace')}")
+
+def validate_environment():
+    errors = []
+    if config.FORCE_CLEAR_CHECKPOINTS and os.path.exists(config.CHECKPOINT_FILE):
+        os.remove(config.CHECKPOINT_FILE)
+        log(">>> FORCE_CLEAR_CHECKPOINTS is ON. Old cache nuked.")
+
+    if not os.path.exists(config.VIDEO_PATH):
+        alt_path = os.path.join(config.WORKSPACE_ROOT, config.VIDEO_FILENAME)
+        if os.path.exists(alt_path):
+            import shutil
+            shutil.copy(alt_path, config.VIDEO_PATH)
+        else:
+            errors.append(f"Video not found: {config.VIDEO_PATH}")
+    if not config.HF_TOKEN:
+        errors.append("HF_TOKEN not set.")
+    if not torch.cuda.is_available():
+        errors.append("CUDA not available.")
+    if errors:
+        for e in errors:
+            log(f"FATAL: {e}")
+        sys.exit(1)
+
+# ============================================================
+# PHASE 1 & 2: AUDIO & SPEAKERS
+# ============================================================
+
+def phase1_transcribe() -> list:
+    cached = load_checkpoint("phase1_transcription")
+    if cached: return cached
+    log("─" * 50)
+    log("PHASE 1: Audio Transcription (Background Data)")
+    
+    from faster_whisper import WhisperModel
+    
+    try:
+        model = WhisperModel(config.WHISPER_MODEL_SIZE, device=config.WHISPER_DEVICE, compute_type=config.WHISPER_COMPUTE_TYPE, download_root=config.CACHE_DIR)
+    except Exception:
+        log("Hugging Face timeout detected. Booting Whisper from local offline cache...")
+        model = WhisperModel(config.WHISPER_MODEL_SIZE, device=config.WHISPER_DEVICE, compute_type=config.WHISPER_COMPUTE_TYPE, download_root=config.CACHE_DIR, local_files_only=True)
+        
+    vad_params = dict(
+        min_silence_duration_ms=getattr(config, 'VAD_MIN_SILENCE_MS', 300),
+        speech_pad_ms=getattr(config, 'VAD_SPEECH_PAD_MS', 100)
+    )
+    
+    segments, _ = model.transcribe(
+        config.VIDEO_PATH, 
+        language=config.WHISPER_LANGUAGE, 
+        vad_filter=True, 
+        vad_parameters=vad_params,
+        condition_on_previous_text=False
+    )
+    
+    results = []
+    for seg in segments:
+        if seg.end <= config.SKIP_INTRO_SECONDS: continue
+        start_time = max(seg.start, config.SKIP_INTRO_SECONDS)
+        if start_time >= HARD_CUTOFF_SECONDS: break
+        
+        end_time = min(seg.end, HARD_CUTOFF_SECONDS)
+        results.append({"start": round(start_time, 3), "end": round(end_time, 3), "text": seg.text.strip()})
+        
+    del model
+    flush_gpu()
+    save_checkpoint("phase1_transcription", results)
+    return results
+
+def phase2_diarize() -> list:
+    cached = load_checkpoint("phase2_diarization")
+    if cached: return cached
+    
+    log("─" * 50)
+    log("PHASE 2: Speaker Diarization")
+
+    from pyannote.audio import Pipeline
+    
+    audio_path = os.path.join(config.CACHE_DIR, "diarization_audio.wav")
+    if not os.path.exists(audio_path):
+        log(f"Extracting WAV to {audio_path}...")
+        extract_audio_wav(config.VIDEO_PATH, audio_path)
+
+    log("Loading pyannote/speaker-diarization-3.1...")
+    try:
+        pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1", 
+            use_auth_token=config.HF_TOKEN,
+            cache_dir=config.CACHE_DIR
+        )
+        if torch.cuda.is_available():
+            pipeline.to(torch.device("cuda"))
+    except Exception as e:
+        log("FATAL: Pyannote failed to load.")
+        raise e
+
+    log("Processing audio for speaker turns...")
+    diarization = pipeline(audio_path)
+
+    results = []
+    for turn, _, speaker in diarization.itertracks(yield_label=True):
+        if turn.end <= config.SKIP_INTRO_SECONDS: continue
+        start_time = max(turn.start, config.SKIP_INTRO_SECONDS)
+        if start_time >= HARD_CUTOFF_SECONDS: break
+        end_time = min(turn.end, HARD_CUTOFF_SECONDS)
+        results.append({"start": round(start_time, 3), "end": round(end_time, 3), "speaker": speaker})
+
+    del pipeline
+    flush_gpu()
+    save_checkpoint("phase2_diarization", results)
+    return results
+
+# ============================================================
+# PHASE 3: THE OCR DUAL-BOX MASTER CLOCK
+# ============================================================
+
+def is_valid_ocr(text: str) -> bool:
+    if not text: return False
+    text = text.strip()
+    cjk_chars = re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', text)
+    if len(cjk_chars) >= 2: return True
+    if len(cjk_chars) == 1 and len(text) <= 3: return True
+    return False
+
+def phase3_ocr_master_clock() -> list:
+    log("─" * 50)
+    log("PHASE 3: OCR Master Clock (Dual-Engine Sweep)")
+    cached = load_checkpoint("phase3_ocr_timeline")
+    if cached: return cached
+
+    import easyocr
+    from paddleocr import PaddleOCR
+    import logging
+
+    logging.getLogger("ppocr").setLevel(logging.ERROR)
+
+    log("Booting EasyOCR and PaddleOCR...")
+    reader_env = easyocr.Reader(config.OCR_LANGUAGES, gpu=True, model_storage_directory=config.CACHE_DIR, verbose=False)
+    reader_sub = PaddleOCR(use_angle_cls=False, lang="ch", show_log=False)
+
+    cap = cv2.VideoCapture(config.VIDEO_PATH)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    cutoff_frames = int(HARD_CUTOFF_SECONDS * fps)
+    max_frames = min(total_frames, cutoff_frames)
+    start_frame = int(config.SKIP_INTRO_SECONDS * fps)
+    frame_step = int(fps / config.OCR_SWEEP_FPS) 
+    
+    ocr_timeline = []
+    current_block = None
+
+    log(f"Sweeping video at {config.OCR_SWEEP_FPS} FPS...")
+    for f in tqdm(range(start_frame, max_frames, frame_step), desc="OCR Sweep"):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, f)
+        ret, frame = cap.read()
+        if not ret or frame is None: continue
+        
+        current_time = round(f / fps, 3)
+        h, w = frame.shape[:2]
+        
+        env_crop = frame[
+            int(h * config.OCR_ENV_TOP):int(h * config.OCR_ENV_BOTTOM), 
+            int(w * config.OCR_ENV_LEFT):int(w * config.OCR_ENV_RIGHT)
+        ]
+        sub_crop = frame[
+            int(h * config.OCR_SUB_TOP):int(h * config.OCR_SUB_BOTTOM), 
+            int(w * config.OCR_SUB_LEFT):int(w * config.OCR_SUB_RIGHT)
+        ]
+        
+        env_res = reader_env.readtext(env_crop, detail=0, paragraph=True)
+        env_text = " ".join(env_res).strip()
+        
+        sub_text = ""
+        sub_res = reader_sub.ocr(sub_crop, cls=False)
+        if sub_res and sub_res[0]:
+            sub_text = " ".join([line[1][0] for line in sub_res[0]]).strip()
+
+        valid_env = is_valid_ocr(env_text)
+        valid_sub = is_valid_ocr(sub_text)
+
+        if valid_env and valid_sub:
+            if sub_text in env_text or difflib.SequenceMatcher(None, env_text, sub_text).ratio() > 0.85:
+                env_text = "[Same as Sub]"
+                valid_env = False
+
+        if valid_env or valid_sub:
+            if current_block is None:
+                current_block = {
+                    "start": current_time, "end": current_time + (1.0/config.OCR_SWEEP_FPS), 
+                    "ocr_env": env_text if valid_env else "[None]", 
+                    "ocr_sub": sub_text if valid_sub else "[None]"
+                }
+            else:
+                if valid_sub or current_block["ocr_sub"] != "[None]":
+                    similarity = difflib.SequenceMatcher(None, sub_text, current_block["ocr_sub"]).ratio()
+                else:
+                    similarity = difflib.SequenceMatcher(None, env_text, current_block["ocr_env"]).ratio()
+
+                current_dur = current_time - current_block["start"]
+                if similarity > config.OCR_SIMILARITY_THRESH and current_dur < 6.0:
+                    if len(env_text) > len(current_block["ocr_env"]) and valid_env:
+                        current_block["ocr_env"] = env_text
+                    if len(sub_text) > len(current_block["ocr_sub"]) and valid_sub:
+                        current_block["ocr_sub"] = sub_text
+                    current_block["end"] = current_time + (1.0/config.OCR_SWEEP_FPS)
+                else:
+                    ocr_timeline.append(current_block)
+                    current_block = {
+                        "start": current_time, "end": current_time + (1.0/config.OCR_SWEEP_FPS), 
+                        "ocr_env": env_text if valid_env else "[None]", 
+                        "ocr_sub": sub_text if valid_sub else "[None]"
+                    }
+        else:
+            if current_block is not None:
+                ocr_timeline.append(current_block)
+                current_block = None
+
+    if current_block is not None:
+        ocr_timeline.append(current_block)
+
+    cap.release()
+    del reader_env, reader_sub
+    flush_gpu()
+    
+    save_checkpoint("phase3_ocr_timeline", ocr_timeline)
+    return ocr_timeline
+
+# ============================================================
+# PHASE 4: DATA MERGING & VISION CONTEXT
+# ============================================================
+
+def _get_speaker(w_start: float, w_end: float, diarization_data: list) -> str:
+    max_overlap = 0.0
+    best_speaker = "SPEAKER_UNKNOWN"
+    for turn in diarization_data:
+        overlap = max(0.0, min(w_end, turn["end"]) - max(w_start, turn["start"]))
+        if overlap > max_overlap:
+            max_overlap = overlap
+            best_speaker = turn["speaker"]
+    return best_speaker
+
+def smooth_timeline(enriched_timeline: list) -> list:
+    smoothed = []
+    current_block = None
+    MAX_BLOCK_DURATION = 6.0 
+
+    for block in enriched_timeline:
+        if current_block is None:
+            current_block = block.copy()
+            continue
+            
+        gap = block["start"] - current_block["end"]
+        same_speaker = (current_block["speaker"] == block["speaker"])
+        same_sub = (current_block["ocr_sub"] == block["ocr_sub"])
+        is_audio_only = (current_block["type"] == "AUDIO_ONLY" or block["type"] == "AUDIO_ONLY")
+        current_dur = current_block["end"] - current_block["start"]
+        
+        if same_speaker and same_sub and gap < 1.0 and not is_audio_only and current_dur < MAX_BLOCK_DURATION:
+            current_block["end"] = block["end"]
+            if block["audio_text"] not in current_block["audio_text"] and block["audio_text"] != "[No localized audio]":
+                if current_block["audio_text"] == "[No localized audio]":
+                    current_block["audio_text"] = block["audio_text"]
+                else:
+                    current_block["audio_text"] += " " + block["audio_text"]
+        else:
+            smoothed.append(current_block)
+            current_block = block.copy()
+
+    if current_block:
+        smoothed.append(current_block)
+        
+    return smoothed
+
+def deduplicate_whisper_stutter(timeline: list) -> list:
+    deduped = []
+    for i, block in enumerate(timeline):
+        if i == 0:
+            deduped.append(block.copy())
+            continue
+        
+        prev = deduped[-1]
+        curr_block = block.copy()
+        
+        curr_audio = curr_block.get("audio_text", "")
+        prev_audio = prev.get("audio_text", "")
+        
+        is_valid_audio = lambda x: x not in ["[No localized audio]", "", "[None]"]
+        
+        if not is_valid_audio(curr_audio) or not is_valid_audio(prev_audio):
+            deduped.append(curr_block)
+            continue
+            
+        same_speaker = (curr_block["speaker"] == prev["speaker"])
+        gap = curr_block["start"] - prev["end"]
+        
+        if same_speaker and gap < 2.0:
+            sim = difflib.SequenceMatcher(None, prev_audio, curr_audio).ratio()
+            is_stutter = (prev_audio in curr_audio) or (curr_audio in prev_audio) or (sim > 0.80)
+            
+            if is_stutter:
+                if len(curr_audio) > len(prev_audio):
+                    prev["audio_text"] = curr_audio
+                curr_block["audio_text"] = "[No localized audio]"
+                
+        deduped.append(curr_block)
+        
+    return deduped
+
+def enforce_chronological_bounds(timeline: list) -> list:
+    """
+    TRIPLE-CHECKED: Bulletproof timestamp clamping.
+    Completely eliminates negative time jumps and exact-millisecond overlaps.
+    """
+    # Sort one final time to guarantee processing order
+    timeline = sorted(timeline, key=lambda x: x["start"])
+    
+    for i in range(1, len(timeline)):
+        prev = timeline[i-1]
+        curr = timeline[i]
+        
+        # If the previous block bleeds into or touches the current block
+        if prev["end"] > curr["start"]:
+            # Force prev block to end 10ms before the next block starts
+            clamped_end = curr["start"] - 0.01
+            
+            # Fallback: if they somehow started at the exact same millisecond, force minimum duration
+            if clamped_end <= prev["start"]:
+                clamped_end = prev["start"] + 0.10
+                curr["start"] = clamped_end + 0.01
+                
+            timeline[i-1]["end"] = clamped_end
+            
+    return timeline
+
+def phase4_data_merger(ocr_timeline: list, zh_data: list, diarization_data: list) -> list:
+    log("─" * 50)
+    log("PHASE 4: Audio Merging & Florence-2 Vision")
+    cached = load_checkpoint("phase4_enriched")
+    if cached: return cached
+
+    mapped_whisper_indices = set()
+    enriched_timeline = []
+
+    for block in ocr_timeline:
+        block["block_audio_list"] = []
+
+    for i, w in enumerate(zh_data):
+        w_start, w_end = w["start"], w["end"]
+        segment_dur = w_end - w_start
+        
+        best_block = None
+        max_overlap = 0.0
+        
+        for block in ocr_timeline:
+            overlap = max(0.0, min(block["end"], w_end) - max(block["start"], w_start))
+            if overlap > max_overlap:
+                max_overlap = overlap
+                best_block = block
+                
+        if best_block and (max_overlap > 0.5 or (segment_dur > 0 and (max_overlap / segment_dur) > 0.3)):
+            best_block["block_audio_list"].append(w["text"])
+            mapped_whisper_indices.add(i)
+
+    for block in ocr_timeline:
+        speaker = _get_speaker(block["start"], block["end"], diarization_data)
+        audio_joined = " ".join(block["block_audio_list"])
+        enriched_timeline.append({
+            "type": "ON_SCREEN_TEXT",
+            "start": block["start"],
+            "end": block["end"],
+            "speaker": f"[{speaker}]" if audio_joined else "[ENVIRONMENT]",
+            "audio_text": audio_joined if audio_joined else "[No localized audio]",
+            "ocr_env": block["ocr_env"],
+            "ocr_sub": block["ocr_sub"]
+        })
+
+    for i, w in enumerate(zh_data):
+        if i not in mapped_whisper_indices:
+            speaker = _get_speaker(w["start"], w["end"], diarization_data)
+            enriched_timeline.append({
+                "type": "AUDIO_ONLY",
+                "start": w["start"],
+                "end": w["end"],
+                "speaker": f"[{speaker}]",
+                "audio_text": w["text"],
+                "ocr_env": "[No text on screen]",
+                "ocr_sub": "[No text on screen]"
+            })
+
+    enriched_timeline = sorted(enriched_timeline, key=lambda x: x["start"])
+    enriched_timeline = smooth_timeline(enriched_timeline)
+    enriched_timeline = deduplicate_whisper_stutter(enriched_timeline)
+
+    pruned_timeline = []
+    for block in enriched_timeline:
+        has_audio = block.get("audio_text") not in ["[No localized audio]", "", "[None]"]
+        has_sub = block.get("ocr_sub") not in ["[None]", "[No text on screen]"]
+        has_env = block.get("ocr_env") not in ["[None]", "[No text on screen]"]
+        
+        if not has_audio and not has_sub and not has_env:
+            continue 
+        pruned_timeline.append(block)
+    
+    # Run the timestamp clamp right before vision
+    enriched_timeline = enforce_chronological_bounds(pruned_timeline)
+
+    from transformers import AutoProcessor, AutoModelForCausalLM
+    try:
+        vision_processor = AutoProcessor.from_pretrained(config.FLORENCE_MODEL_ID, trust_remote_code=True, cache_dir=config.CACHE_DIR)
+        vision_model = AutoModelForCausalLM.from_pretrained(config.FLORENCE_MODEL_ID, trust_remote_code=True, torch_dtype=torch.float16, cache_dir=config.CACHE_DIR).cuda().eval()
+    except Exception:
+        vision_processor = AutoProcessor.from_pretrained(config.FLORENCE_MODEL_ID, trust_remote_code=True, cache_dir=config.CACHE_DIR, local_files_only=True)
+        vision_model = AutoModelForCausalLM.from_pretrained(config.FLORENCE_MODEL_ID, trust_remote_code=True, torch_dtype=torch.float16, cache_dir=config.CACHE_DIR, local_files_only=True).cuda().eval()
+
+    cap = cv2.VideoCapture(config.VIDEO_PATH)
+    _FLORENCE_TAGS = ["</s>", "<s>", "<MORE_DETAILED_CAPTION>", "<pad>", "<unk>"]
+
+    log("Running Florence-2 on timeline midpoints...")
+    last_scene_desc = "[Frame read failed]"
+    last_scene_time = -999.0
+
+    for idx, block in enumerate(tqdm(enriched_timeline, desc="Vision Context")):
+        midpoint_s = block["start"] + (block["end"] - block["start"]) / 2.0
+        
+        if (midpoint_s - last_scene_time) < 2.0:
+            block["scene_description"] = last_scene_desc
+            continue
+
+        cap.set(cv2.CAP_PROP_POS_MSEC, midpoint_s * 1000)
+        ret, frame = cap.read()
+        scene_description = "[Frame read failed]"
+
+        if ret and frame is not None:
+            try:
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil_img = Image.fromarray(rgb_frame)
+                with torch.inference_mode():
+                    inputs = vision_processor(text="<MORE_DETAILED_CAPTION>", images=pil_img, return_tensors="pt").to("cuda", dtype=torch.float16)
+                    generated_ids = vision_model.generate(input_ids=inputs["input_ids"], pixel_values=inputs["pixel_values"], max_new_tokens=512, do_sample=False, num_beams=3)
+                raw_caption = vision_processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+                for tag in _FLORENCE_TAGS: raw_caption = raw_caption.replace(tag, "")
+                scene_description = raw_caption.strip()
+            except torch.cuda.OutOfMemoryError:
+                flush_gpu()
+                scene_description = "[Vision skipped: OOM]"
+            except Exception:
+                scene_description = "[Vision skipped/error]"
+
+        block["scene_description"] = scene_description
+        last_scene_desc = scene_description
+        last_scene_time = midpoint_s
+        
+        if idx > 0 and idx % 50 == 0: flush_gpu()
+
+    cap.release()
+    del vision_model, vision_processor
+    flush_gpu()
+
+    save_checkpoint("phase4_enriched", enriched_timeline)
+    return enriched_timeline
+
+# ============================================================
+# PHASE 5: EXPORT (3 FILES / CONTINUOUS INDEXING)
+# ============================================================
+
+def write_export_file(blocks: list, filepath: str, title: str, start_index: int):
+    lines = []
+    lines.append("=" * 70)
+    lines.append(f"FOUR-PILLAR SENSORY EXTRACTION — {title}")
+    lines.append(f"Source    : {config.VIDEO_FILENAME}")
+    lines.append(f"Cutoff    : {HARD_CUTOFF_SECONDS} seconds (21:25)")
+    lines.append(f"Blocks    : {len(blocks)}")
+    lines.append(f"Generated : {datetime.datetime.now().isoformat()}")
+    lines.append("=" * 70)
+    lines.append("")
+
+    for i, block in enumerate(blocks, start_index):
+        time_str = f"{format_time(block['start'])} --> {format_time(block['end'])}"
+        lines.append(f"{'─'*50}")
+        lines.append(f"Block {i:04d} | {block['type']} | {time_str}")
+        lines.append(f"Speaker  : {block['speaker']}")
+        lines.append(f"ZH Audio : {block['audio_text']}")
+        lines.append(f"Scene    : {block['scene_description']}")
+        lines.append(f"OCR(Env) : {block.get('ocr_env', '[None]')}")
+        lines.append(f"OCR(Sub) : {block.get('ocr_sub', '[None]')}")
+        lines.append("")
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    log(f"TXT ({title}) → {filepath}")
+
+def phase5_export(enriched_timeline: list):
+    log("─" * 50)
+    log("PHASE 5: Exporting (Full Dump + Part 1 & Part 2)")
+
+    # Save JSON
+    json_path = config.OUTPUT_PATH.replace(".txt", ".json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(enriched_timeline, f, ensure_ascii=False, indent=2)
+
+    # 1. Full Dump (1 to end)
+    write_export_file(enriched_timeline, config.OUTPUT_PATH, "Full Dump", 1)
+
+    # 2. Part 1 & Part 2 Split
+    mid_idx = len(enriched_timeline) // 2
+    part1_blocks = enriched_timeline[:mid_idx]
+    part2_blocks = enriched_timeline[mid_idx:]
+
+    part1_path = config.OUTPUT_PATH.replace(".txt", "_Part1.txt")
+    part2_path = config.OUTPUT_PATH.replace(".txt", "_Part2.txt")
+
+    write_export_file(part1_blocks, part1_path, "Part 1", 1)
+    write_export_file(part2_blocks, part2_path, "Part 2", mid_idx + 1)
+
+# ============================================================
+# MAIN ORCHESTRATOR
+# ============================================================
+
+def run_pipeline():
+    log("=" * 50)
+    log("FOUR-PILLAR EXTRACTION PIPELINE — START")
+    log("=" * 50)
+
+    validate_environment()
+    zh_data = phase1_transcribe()
+    diarization_data = phase2_diarize()
+    
+    ocr_timeline = phase3_ocr_master_clock()
+    enriched_timeline = phase4_data_merger(ocr_timeline, zh_data, diarization_data)
+
+    phase5_export(enriched_timeline)
+
+    log("=" * 50)
+    log("PIPELINE COMPLETE")
+    log("=" * 50)
+
+if __name__ == "__main__":
+    run_pipeline()

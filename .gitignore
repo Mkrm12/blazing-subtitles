@@ -1,0 +1,13 @@
+# Secrets
+.env
+
+# Media & Data Dumps
+*.mp4
+*.wav
+*.json
+*.txt
+*.srt
+
+# AI Caches
+.cache/
+models/
