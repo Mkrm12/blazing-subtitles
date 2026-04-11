@@ -1,6 +1,6 @@
 """
 pipeline.py — Four-Pillar Sensory Extraction Pipeline
-Dual-Box OCR Master Clock Architecture
+Dual-Box OCR Master Clock Architecture (v11 Base + Pyannote Bleed Fix + Micro-Grid Exemption)
 """
 
 import cv2
@@ -24,8 +24,8 @@ import config
 # UTILITIES & CONFIG OVERRIDES
 # ============================================================
 
-# TRIPLE-CHECKED: Hard stop at 21:25 to skip ending credits
-HARD_CUTOFF_SECONDS = 1285.0 
+# TRIPLE-CHECKED: Dynamic time limit using config
+HARD_CUTOFF_SECONDS = config.MAX_MINUTES * 60.0 
 
 def log(msg: str):
     now = datetime.datetime.now().strftime("%H:%M:%S")
@@ -141,7 +141,6 @@ def phase1_transcribe() -> list:
         if seg.end <= config.SKIP_INTRO_SECONDS: continue
         start_time = max(seg.start, config.SKIP_INTRO_SECONDS)
         if start_time >= HARD_CUTOFF_SECONDS: break
-        
         end_time = min(seg.end, HARD_CUTOFF_SECONDS)
         results.append({"start": round(start_time, 3), "end": round(end_time, 3), "text": seg.text.strip()})
         
@@ -158,7 +157,6 @@ def phase2_diarize() -> list:
     log("PHASE 2: Speaker Diarization")
 
     from pyannote.audio import Pipeline
-    
     audio_path = os.path.join(config.CACHE_DIR, "diarization_audio.wav")
     if not os.path.exists(audio_path):
         log(f"Extracting WAV to {audio_path}...")
@@ -166,11 +164,7 @@ def phase2_diarize() -> list:
 
     log("Loading pyannote/speaker-diarization-3.1...")
     try:
-        pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1", 
-            use_auth_token=config.HF_TOKEN,
-            cache_dir=config.CACHE_DIR
-        )
+        pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=config.HF_TOKEN, cache_dir=config.CACHE_DIR)
         if torch.cuda.is_available():
             pipeline.to(torch.device("cuda"))
     except Exception as e:
@@ -194,20 +188,12 @@ def phase2_diarize() -> list:
     return results
 
 # ============================================================
-# PHASE 3: THE OCR DUAL-BOX MASTER CLOCK
+# PHASE 3: THE OCR DUAL-BOX MASTER CLOCK 
 # ============================================================
-
-def is_valid_ocr(text: str) -> bool:
-    if not text: return False
-    text = text.strip()
-    cjk_chars = re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', text)
-    if len(cjk_chars) >= 2: return True
-    if len(cjk_chars) == 1 and len(text) <= 3: return True
-    return False
 
 def phase3_ocr_master_clock() -> list:
     log("─" * 50)
-    log("PHASE 3: OCR Master Clock (Dual-Engine Sweep)")
+    log("PHASE 3: OCR Master Clock (Base v11 + Grid Whitelist)")
     cached = load_checkpoint("phase3_ocr_timeline")
     if cached: return cached
 
@@ -251,16 +237,50 @@ def phase3_ocr_master_clock() -> list:
             int(w * config.OCR_SUB_LEFT):int(w * config.OCR_SUB_RIGHT)
         ]
         
-        env_res = reader_env.readtext(env_crop, detail=0, paragraph=True)
-        env_text = " ".join(env_res).strip()
+        # --- ENV OCR (v11 Base Logic + Grid Whitelist for 1-Char) ---
+        env_texts = []
+        env_protected = False
+        env_res = reader_env.readtext(env_crop, detail=1, paragraph=True)
+        for res in env_res:
+            box, text = res[0], res[1]
+            cjk_chars = re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', text)
+            if len(cjk_chars) >= 2:
+                # V11 Base: Any 2+ chars is unconditionally saved
+                env_texts.append(text)
+            elif len(cjk_chars) == 1:
+                # 1-Char Safety Net: Only save if dead-center in the subtitle zone
+                cx = sum([pt[0] for pt in box]) / 4.0 + (w * config.OCR_ENV_LEFT)
+                cy = sum([pt[1] for pt in box]) / 4.0 + (h * config.OCR_ENV_TOP)
+                row_idx = int(cy / (h / 9.0))
+                col_idx = int(cx / (w / 6.0))
+                if row_idx in [7, 8] and col_idx in [2, 3]:
+                    env_texts.append(text)
+                    env_protected = True
         
-        sub_text = ""
+        env_text = " ".join(env_texts).strip()
+        valid_env = bool(env_text)
+
+        # --- SUB OCR (v11 Base Logic + Grid Whitelist for 1-Char) ---
+        sub_texts = []
+        sub_protected = False
         sub_res = reader_sub.ocr(sub_crop, cls=False)
         if sub_res and sub_res[0]:
-            sub_text = " ".join([line[1][0] for line in sub_res[0]]).strip()
-
-        valid_env = is_valid_ocr(env_text)
-        valid_sub = is_valid_ocr(sub_text)
+            for line in sub_res[0]:
+                box, text = line[0], line[1][0]
+                cjk_chars = re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', text)
+                if len(cjk_chars) >= 2:
+                    sub_texts.append(text)
+                elif len(cjk_chars) == 1:
+                    cx = sum([pt[0] for pt in box]) / 4.0 + (w * config.OCR_SUB_LEFT)
+                    cy = sum([pt[1] for pt in box]) / 4.0 + (h * config.OCR_SUB_TOP)
+                    row_idx = int(cy / (h / 9.0))
+                    col_idx = int(cx / (w / 6.0))
+                    if row_idx in [7, 8] and col_idx in [2, 3]:
+                        sub_texts.append(text)
+                        sub_protected = True
+                        
+        sub_text = " ".join(sub_texts).strip()
+        valid_sub = bool(sub_text)
 
         if valid_env and valid_sub:
             if sub_text in env_text or difflib.SequenceMatcher(None, env_text, sub_text).ratio() > 0.85:
@@ -268,11 +288,14 @@ def phase3_ocr_master_clock() -> list:
                 valid_env = False
 
         if valid_env or valid_sub:
+            is_protected = env_protected or sub_protected
+            
             if current_block is None:
                 current_block = {
                     "start": current_time, "end": current_time + (1.0/config.OCR_SWEEP_FPS), 
                     "ocr_env": env_text if valid_env else "[None]", 
-                    "ocr_sub": sub_text if valid_sub else "[None]"
+                    "ocr_sub": sub_text if valid_sub else "[None]",
+                    "is_protected": is_protected
                 }
             else:
                 if valid_sub or current_block["ocr_sub"] != "[None]":
@@ -287,12 +310,15 @@ def phase3_ocr_master_clock() -> list:
                     if len(sub_text) > len(current_block["ocr_sub"]) and valid_sub:
                         current_block["ocr_sub"] = sub_text
                     current_block["end"] = current_time + (1.0/config.OCR_SWEEP_FPS)
+                    # If the text kept growing, it's no longer just a 1-character micro expression
+                    current_block["is_protected"] = False 
                 else:
                     ocr_timeline.append(current_block)
                     current_block = {
                         "start": current_time, "end": current_time + (1.0/config.OCR_SWEEP_FPS), 
                         "ocr_env": env_text if valid_env else "[None]", 
-                        "ocr_sub": sub_text if valid_sub else "[None]"
+                        "ocr_sub": sub_text if valid_sub else "[None]",
+                        "is_protected": is_protected
                     }
         else:
             if current_block is not None:
@@ -310,8 +336,12 @@ def phase3_ocr_master_clock() -> list:
     return ocr_timeline
 
 # ============================================================
-# PHASE 4: DATA MERGING & VISION CONTEXT
+# PHASE 4: DATA MERGING, NLP FILTERING & VISION CONTEXT
 # ============================================================
+
+def _clean_audio(text: str) -> str:
+    """Strips out [SPEAKER] tags so they don't break the NLP math comparisons."""
+    return re.sub(r'\[.*?\]\s*', '', text).strip()
 
 def _get_speaker(w_start: float, w_end: float, diarization_data: list) -> str:
     max_overlap = 0.0
@@ -341,10 +371,15 @@ def smooth_timeline(enriched_timeline: list) -> list:
         
         if same_speaker and same_sub and gap < 1.0 and not is_audio_only and current_dur < MAX_BLOCK_DURATION:
             current_block["end"] = block["end"]
-            if block["audio_text"] not in current_block["audio_text"] and block["audio_text"] != "[No localized audio]":
+            
+            clean_curr = _clean_audio(current_block["audio_text"])
+            clean_new = _clean_audio(block["audio_text"])
+            
+            if clean_new not in clean_curr and clean_new != "[No localized audio]":
                 if current_block["audio_text"] == "[No localized audio]":
                     current_block["audio_text"] = block["audio_text"]
                 else:
+                    # Append exactly as formatted, keeping speaker tags intact
                     current_block["audio_text"] += " " + block["audio_text"]
         else:
             smoothed.append(current_block)
@@ -378,40 +413,61 @@ def deduplicate_whisper_stutter(timeline: list) -> list:
         gap = curr_block["start"] - prev["end"]
         
         if same_speaker and gap < 2.0:
-            sim = difflib.SequenceMatcher(None, prev_audio, curr_audio).ratio()
-            is_stutter = (prev_audio in curr_audio) or (curr_audio in prev_audio) or (sim > 0.80)
+            clean_prev = _clean_audio(prev_audio)
+            clean_curr = _clean_audio(curr_audio)
+            
+            sim = difflib.SequenceMatcher(None, clean_prev, clean_curr).ratio()
+            is_stutter = (clean_prev in clean_curr) or (clean_curr in clean_prev) or (sim > 0.80)
             
             if is_stutter:
-                if len(curr_audio) > len(prev_audio):
+                if len(clean_curr) > len(clean_prev):
                     prev["audio_text"] = curr_audio
+                
                 curr_block["audio_text"] = "[No localized audio]"
+                
+                if curr_block.get("ocr_sub") == prev.get("ocr_sub"):
+                    curr_block["ocr_sub"] = "[None]"
+                if curr_block.get("ocr_env") == prev.get("ocr_env"):
+                    curr_block["ocr_env"] = "[None]"
                 
         deduped.append(curr_block)
         
     return deduped
 
+def sweep_trailing_micro_blocks(timeline: list) -> list:
+    swept = []
+    for i, block in enumerate(timeline):
+        if i == 0:
+            swept.append(block.copy())
+            continue
+
+        prev = swept[-1]
+        curr = block.copy()
+        
+        curr_dur = curr["end"] - curr["start"]
+        has_audio = curr.get("audio_text") not in ["[No localized audio]", "", "[None]"]
+        
+        same_sub = curr.get("ocr_sub") != "[None]" and curr.get("ocr_sub") == prev.get("ocr_sub")
+        same_env = curr.get("ocr_env") != "[None]" and curr.get("ocr_env") == prev.get("ocr_env")
+        
+        if not has_audio and curr_dur < 0.6 and (same_sub or same_env):
+            prev["end"] = curr["end"]
+        else:
+            swept.append(curr)
+            
+    return swept
+
 def enforce_chronological_bounds(timeline: list) -> list:
-    """
-    TRIPLE-CHECKED: Bulletproof timestamp clamping.
-    Completely eliminates negative time jumps and exact-millisecond overlaps.
-    """
-    # Sort one final time to guarantee processing order
     timeline = sorted(timeline, key=lambda x: x["start"])
-    
     for i in range(1, len(timeline)):
         prev = timeline[i-1]
         curr = timeline[i]
         
-        # If the previous block bleeds into or touches the current block
         if prev["end"] > curr["start"]:
-            # Force prev block to end 10ms before the next block starts
             clamped_end = curr["start"] - 0.01
-            
-            # Fallback: if they somehow started at the exact same millisecond, force minimum duration
             if clamped_end <= prev["start"]:
                 clamped_end = prev["start"] + 0.10
                 curr["start"] = clamped_end + 0.01
-                
             timeline[i-1]["end"] = clamped_end
             
     return timeline
@@ -428,6 +484,10 @@ def phase4_data_merger(ocr_timeline: list, zh_data: list, diarization_data: list
     for block in ocr_timeline:
         block["block_audio_list"] = []
 
+    # TRIPLE-CHECKED: Pyannote Pre-Diarization injected before merging
+    for w in zh_data:
+        w["speaker"] = _get_speaker(w["start"], w["end"], diarization_data)
+
     for i, w in enumerate(zh_data):
         w_start, w_end = w["start"], w["end"]
         segment_dur = w_end - w_start
@@ -442,50 +502,87 @@ def phase4_data_merger(ocr_timeline: list, zh_data: list, diarization_data: list
                 best_block = block
                 
         if best_block and (max_overlap > 0.5 or (segment_dur > 0 and (max_overlap / segment_dur) > 0.3)):
-            best_block["block_audio_list"].append(w["text"])
+            # Store tuple of speaker and text to preserve dialogue breaks
+            best_block["block_audio_list"].append((w["speaker"], w["text"]))
             mapped_whisper_indices.add(i)
 
     for block in ocr_timeline:
-        speaker = _get_speaker(block["start"], block["end"], diarization_data)
-        audio_joined = " ".join(block["block_audio_list"])
+        audio_lines = []
+        current_spk = None
+        
+        # Stitch audio back together, injecting [SPEAKER] tags only when the person changes
+        for spk, txt in block["block_audio_list"]:
+            if spk != current_spk:
+                audio_lines.append(f"[{spk}] {txt}")
+                current_spk = spk
+            else:
+                audio_lines.append(txt)
+                
+        audio_joined = " ".join(audio_lines)
+        block_primary_speaker = block["block_audio_list"][0][0] if block["block_audio_list"] else "[ENVIRONMENT]"
+        
         enriched_timeline.append({
             "type": "ON_SCREEN_TEXT",
             "start": block["start"],
             "end": block["end"],
-            "speaker": f"[{speaker}]" if audio_joined else "[ENVIRONMENT]",
+            "speaker": f"[{block_primary_speaker}]" if audio_joined else "[ENVIRONMENT]",
             "audio_text": audio_joined if audio_joined else "[No localized audio]",
             "ocr_env": block["ocr_env"],
-            "ocr_sub": block["ocr_sub"]
+            "ocr_sub": block["ocr_sub"],
+            "is_protected": block.get("is_protected", False)
         })
 
     for i, w in enumerate(zh_data):
         if i not in mapped_whisper_indices:
-            speaker = _get_speaker(w["start"], w["end"], diarization_data)
             enriched_timeline.append({
                 "type": "AUDIO_ONLY",
                 "start": w["start"],
                 "end": w["end"],
-                "speaker": f"[{speaker}]",
-                "audio_text": w["text"],
+                "speaker": f"[{w['speaker']}]",
+                "audio_text": f"[{w['speaker']}] {w['text']}",
                 "ocr_env": "[No text on screen]",
-                "ocr_sub": "[No text on screen]"
+                "ocr_sub": "[No text on screen]",
+                "is_protected": False
             })
 
     enriched_timeline = sorted(enriched_timeline, key=lambda x: x["start"])
     enriched_timeline = smooth_timeline(enriched_timeline)
     enriched_timeline = deduplicate_whisper_stutter(enriched_timeline)
+    enriched_timeline = sweep_trailing_micro_blocks(enriched_timeline)
 
+    # TRIPLE-CHECKED: Base v11 Contextual Garbage Collection 
     pruned_timeline = []
-    for block in enriched_timeline:
+    for i, block in enumerate(enriched_timeline):
         has_audio = block.get("audio_text") not in ["[No localized audio]", "", "[None]"]
         has_sub = block.get("ocr_sub") not in ["[None]", "[No text on screen]"]
         has_env = block.get("ocr_env") not in ["[None]", "[No text on screen]"]
         
         if not has_audio and not has_sub and not has_env:
             continue 
+            
+        sub_len = len(block["ocr_sub"]) if has_sub else 0
+        env_len = len(block["ocr_env"]) if has_env else 0
+        max_text_len = max(sub_len, env_len)
+        
+        # Kill it if it's < 3 chars, has no audio, AND wasn't saved by our 9x6 grid whitelist
+        is_suspicious_garbage = (not has_audio) and (max_text_len < 3) and (not block.get("is_protected", False))
+        
+        if is_suspicious_garbage:
+            is_near_audio = False
+            if i > 0:
+                prev_block = enriched_timeline[i-1]
+                if prev_block.get("audio_text") not in ["[No localized audio]", "", "[None]"] and (block["start"] - prev_block["end"]) < 1.5:
+                    is_near_audio = True
+            if i < len(enriched_timeline) - 1:
+                next_block = enriched_timeline[i+1]
+                if next_block.get("audio_text") not in ["[No localized audio]", "", "[None]"] and (next_block["start"] - block["end"]) < 1.5:
+                    is_near_audio = True
+            
+            if not is_near_audio:
+                continue
+                
         pruned_timeline.append(block)
     
-    # Run the timestamp clamp right before vision
     enriched_timeline = enforce_chronological_bounds(pruned_timeline)
 
     from transformers import AutoProcessor, AutoModelForCausalLM
@@ -552,7 +649,7 @@ def write_export_file(blocks: list, filepath: str, title: str, start_index: int)
     lines.append("=" * 70)
     lines.append(f"FOUR-PILLAR SENSORY EXTRACTION — {title}")
     lines.append(f"Source    : {config.VIDEO_FILENAME}")
-    lines.append(f"Cutoff    : {HARD_CUTOFF_SECONDS} seconds (21:25)")
+    lines.append(f"Cutoff    : {HARD_CUTOFF_SECONDS} seconds ({config.MAX_MINUTES} mins)")
     lines.append(f"Blocks    : {len(blocks)}")
     lines.append(f"Generated : {datetime.datetime.now().isoformat()}")
     lines.append("=" * 70)
@@ -577,15 +674,12 @@ def phase5_export(enriched_timeline: list):
     log("─" * 50)
     log("PHASE 5: Exporting (Full Dump + Part 1 & Part 2)")
 
-    # Save JSON
     json_path = config.OUTPUT_PATH.replace(".txt", ".json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(enriched_timeline, f, ensure_ascii=False, indent=2)
 
-    # 1. Full Dump (1 to end)
     write_export_file(enriched_timeline, config.OUTPUT_PATH, "Full Dump", 1)
 
-    # 2. Part 1 & Part 2 Split
     mid_idx = len(enriched_timeline) // 2
     part1_blocks = enriched_timeline[:mid_idx]
     part2_blocks = enriched_timeline[mid_idx:]

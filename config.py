@@ -14,7 +14,7 @@ CHECKPOINT_DIR = os.path.join(WORKSPACE_ROOT, "checkpoints")
 for d in [DATA_DIR, OUTPUT_DIR, CACHE_DIR, CHECKPOINT_DIR]:
     os.makedirs(d, exist_ok=True)
 
-VIDEO_FILENAME = "Blazing Teens_01.mp4"
+VIDEO_FILENAME = "Blazing Teens_03.mp4"
 VIDEO_PATH     = os.path.join(DATA_DIR, VIDEO_FILENAME)
 
 # --- CACHE MANAGEMENT ---
