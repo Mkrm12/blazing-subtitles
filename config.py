@@ -14,14 +14,14 @@ CHECKPOINT_DIR = os.path.join(WORKSPACE_ROOT, "checkpoints")
 for d in [DATA_DIR, OUTPUT_DIR, CACHE_DIR, CHECKPOINT_DIR]:
     os.makedirs(d, exist_ok=True)
 
-VIDEO_FILENAME = "Blazing Teens_03.mp4"
+VIDEO_FILENAME = "Blazing Teens_13.mp4"
 VIDEO_PATH     = os.path.join(DATA_DIR, VIDEO_FILENAME)
 
 # --- CACHE MANAGEMENT ---
-FORCE_CLEAR_CHECKPOINTS = False
+FORCE_CLEAR_CHECKPOINTS = True
 
 # --- TIMELINE & PROCESSING KNOBS ---
-MAX_MINUTES                = 21.5
+MAX_MINUTES                = 21.4
 SKIP_INTRO_SECONDS         = 85.0  
 
 # --- OCR MASTER CLOCK SETTINGS ---
@@ -32,8 +32,8 @@ OCR_SIMILARITY_THRESH      = 0.60  # If text is 60% similar, keep extending the 
 # Box 1: Environmental / Loose Box (Catches location names + subtitles)
 OCR_ENV_TOP                = 0.65  
 OCR_ENV_BOTTOM             = 0.90  
-OCR_ENV_LEFT               = 0.10  
-OCR_ENV_RIGHT              = 0.90  
+OCR_ENV_LEFT               = 0.12  
+OCR_ENV_RIGHT              = 0.88  
 
 # Box 2: Subtitle Zoom Box (Strictly isolates the burnt-in subtitles)
 OCR_SUB_TOP                = 0.72  

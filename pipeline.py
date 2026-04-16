@@ -1,6 +1,6 @@
 """
 pipeline.py — Four-Pillar Sensory Extraction Pipeline
-Dual-Box OCR Master Clock Architecture (v11 Base + Pyannote Bleed Fix + Micro-Grid Exemption)
+Dual-Box OCR Master Clock Architecture (Ultra v16 - Holy Ground & Dynamic Cropping)
 """
 
 import cv2
@@ -188,12 +188,12 @@ def phase2_diarize() -> list:
     return results
 
 # ============================================================
-# PHASE 3: THE OCR DUAL-BOX MASTER CLOCK 
+# PHASE 3: THE OCR DUAL-BOX MASTER CLOCK (V16 HOLY GROUND)
 # ============================================================
 
 def phase3_ocr_master_clock() -> list:
     log("─" * 50)
-    log("PHASE 3: OCR Master Clock (Base v11 + Grid Whitelist)")
+    log("PHASE 3: OCR Master Clock (v16 Holy Ground & Dynamic Crop)")
     cached = load_checkpoint("phase3_ocr_timeline")
     if cached: return cached
 
@@ -228,39 +228,44 @@ def phase3_ocr_master_clock() -> list:
         current_time = round(f / fps, 3)
         h, w = frame.shape[:2]
         
+        # V16 Dynamic Crop: Blindfold the left 25% for the first 2m30s (150s) to avoid credits
+        current_env_left = max(config.OCR_ENV_LEFT, 0.25) if current_time <= 150.0 else config.OCR_ENV_LEFT
+        current_sub_left = max(config.OCR_SUB_LEFT, 0.25) if current_time <= 150.0 else config.OCR_SUB_LEFT
+        
         env_crop = frame[
             int(h * config.OCR_ENV_TOP):int(h * config.OCR_ENV_BOTTOM), 
-            int(w * config.OCR_ENV_LEFT):int(w * config.OCR_ENV_RIGHT)
+            int(w * current_env_left):int(w * config.OCR_ENV_RIGHT)
         ]
         sub_crop = frame[
             int(h * config.OCR_SUB_TOP):int(h * config.OCR_SUB_BOTTOM), 
-            int(w * config.OCR_SUB_LEFT):int(w * config.OCR_SUB_RIGHT)
+            int(w * current_sub_left):int(w * config.OCR_SUB_RIGHT)
         ]
         
-        # --- ENV OCR (v11 Base Logic + Grid Whitelist for 1-Char) ---
+        # --- ENV OCR ---
         env_texts = []
         env_protected = False
         env_res = reader_env.readtext(env_crop, detail=1, paragraph=True)
         for res in env_res:
             box, text = res[0], res[1]
             cjk_chars = re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', text)
-            if len(cjk_chars) >= 2:
-                # V11 Base: Any 2+ chars is unconditionally saved
-                env_texts.append(text)
-            elif len(cjk_chars) == 1:
-                # 1-Char Safety Net: Only save if dead-center in the subtitle zone
-                cx = sum([pt[0] for pt in box]) / 4.0 + (w * config.OCR_ENV_LEFT)
+            if len(cjk_chars) > 0:
+                cx = sum([pt[0] for pt in box]) / 4.0 + (w * current_env_left)
                 cy = sum([pt[1] for pt in box]) / 4.0 + (h * config.OCR_ENV_TOP)
                 row_idx = int(cy / (h / 9.0))
                 col_idx = int(cx / (w / 6.0))
-                if row_idx in [7, 8] and col_idx in [2, 3]:
+                
+                # V16 Holy Ground: Row 8 (indices 7, 8), Columns 3 & 4 (indices 2, 3)
+                is_holy_ground = (row_idx in [7, 8]) and (col_idx in [2, 3])
+                
+                if len(cjk_chars) >= 2 or is_holy_ground:
                     env_texts.append(text)
-                    env_protected = True
+                    if is_holy_ground:
+                        env_protected = True
         
         env_text = " ".join(env_texts).strip()
         valid_env = bool(env_text)
 
-        # --- SUB OCR (v11 Base Logic + Grid Whitelist for 1-Char) ---
+        # --- SUB OCR ---
         sub_texts = []
         sub_protected = False
         sub_res = reader_sub.ocr(sub_crop, cls=False)
@@ -268,16 +273,19 @@ def phase3_ocr_master_clock() -> list:
             for line in sub_res[0]:
                 box, text = line[0], line[1][0]
                 cjk_chars = re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', text)
-                if len(cjk_chars) >= 2:
-                    sub_texts.append(text)
-                elif len(cjk_chars) == 1:
-                    cx = sum([pt[0] for pt in box]) / 4.0 + (w * config.OCR_SUB_LEFT)
+                if len(cjk_chars) > 0:
+                    cx = sum([pt[0] for pt in box]) / 4.0 + (w * current_sub_left)
                     cy = sum([pt[1] for pt in box]) / 4.0 + (h * config.OCR_SUB_TOP)
                     row_idx = int(cy / (h / 9.0))
                     col_idx = int(cx / (w / 6.0))
-                    if row_idx in [7, 8] and col_idx in [2, 3]:
+                    
+                    # V16 Holy Ground: Row 8 (indices 7, 8), Columns 3 & 4 (indices 2, 3)
+                    is_holy_ground = (row_idx in [7, 8]) and (col_idx in [2, 3])
+                    
+                    if len(cjk_chars) >= 2 or is_holy_ground:
                         sub_texts.append(text)
-                        sub_protected = True
+                        if is_holy_ground:
+                            sub_protected = True
                         
         sub_text = " ".join(sub_texts).strip()
         valid_sub = bool(sub_text)
@@ -310,8 +318,8 @@ def phase3_ocr_master_clock() -> list:
                     if len(sub_text) > len(current_block["ocr_sub"]) and valid_sub:
                         current_block["ocr_sub"] = sub_text
                     current_block["end"] = current_time + (1.0/config.OCR_SWEEP_FPS)
-                    # If the text kept growing, it's no longer just a 1-character micro expression
-                    current_block["is_protected"] = False 
+                    if is_protected:
+                        current_block["is_protected"] = True
                 else:
                     ocr_timeline.append(current_block)
                     current_block = {
@@ -379,7 +387,6 @@ def smooth_timeline(enriched_timeline: list) -> list:
                 if current_block["audio_text"] == "[No localized audio]":
                     current_block["audio_text"] = block["audio_text"]
                 else:
-                    # Append exactly as formatted, keeping speaker tags intact
                     current_block["audio_text"] += " " + block["audio_text"]
         else:
             smoothed.append(current_block)
@@ -474,7 +481,7 @@ def enforce_chronological_bounds(timeline: list) -> list:
 
 def phase4_data_merger(ocr_timeline: list, zh_data: list, diarization_data: list) -> list:
     log("─" * 50)
-    log("PHASE 4: Audio Merging & Florence-2 Vision")
+    log("PHASE 4: Audio Merging & Safe Pre-Diarization")
     cached = load_checkpoint("phase4_enriched")
     if cached: return cached
 
@@ -484,7 +491,6 @@ def phase4_data_merger(ocr_timeline: list, zh_data: list, diarization_data: list
     for block in ocr_timeline:
         block["block_audio_list"] = []
 
-    # TRIPLE-CHECKED: Pyannote Pre-Diarization injected before merging
     for w in zh_data:
         w["speaker"] = _get_speaker(w["start"], w["end"], diarization_data)
 
@@ -502,7 +508,6 @@ def phase4_data_merger(ocr_timeline: list, zh_data: list, diarization_data: list
                 best_block = block
                 
         if best_block and (max_overlap > 0.5 or (segment_dur > 0 and (max_overlap / segment_dur) > 0.3)):
-            # Store tuple of speaker and text to preserve dialogue breaks
             best_block["block_audio_list"].append((w["speaker"], w["text"]))
             mapped_whisper_indices.add(i)
 
@@ -510,7 +515,6 @@ def phase4_data_merger(ocr_timeline: list, zh_data: list, diarization_data: list
         audio_lines = []
         current_spk = None
         
-        # Stitch audio back together, injecting [SPEAKER] tags only when the person changes
         for spk, txt in block["block_audio_list"]:
             if spk != current_spk:
                 audio_lines.append(f"[{spk}] {txt}")
@@ -521,6 +525,13 @@ def phase4_data_merger(ocr_timeline: list, zh_data: list, diarization_data: list
         audio_joined = " ".join(audio_lines)
         block_primary_speaker = block["block_audio_list"][0][0] if block["block_audio_list"] else "[ENVIRONMENT]"
         
+        ocr_sub_final = block["ocr_sub"]
+        
+        # V16 Flare Gun: Inject the tag directly into the OCR text so DeepSeek knows it's a safe micro-reaction
+        if block.get("is_protected", False) and ocr_sub_final not in ["[None]", "[No text on screen]"]:
+            if len(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', ocr_sub_final)) <= 3:
+                ocr_sub_final = f"[POTENTIAL MICRO-REACTION] {ocr_sub_final}"
+
         enriched_timeline.append({
             "type": "ON_SCREEN_TEXT",
             "start": block["start"],
@@ -528,7 +539,7 @@ def phase4_data_merger(ocr_timeline: list, zh_data: list, diarization_data: list
             "speaker": f"[{block_primary_speaker}]" if audio_joined else "[ENVIRONMENT]",
             "audio_text": audio_joined if audio_joined else "[No localized audio]",
             "ocr_env": block["ocr_env"],
-            "ocr_sub": block["ocr_sub"],
+            "ocr_sub": ocr_sub_final,
             "is_protected": block.get("is_protected", False)
         })
 
@@ -550,7 +561,7 @@ def phase4_data_merger(ocr_timeline: list, zh_data: list, diarization_data: list
     enriched_timeline = deduplicate_whisper_stutter(enriched_timeline)
     enriched_timeline = sweep_trailing_micro_blocks(enriched_timeline)
 
-    # TRIPLE-CHECKED: Base v11 Contextual Garbage Collection 
+    # TRIPLE-CHECKED: Holy Ground Bypass
     pruned_timeline = []
     for i, block in enumerate(enriched_timeline):
         has_audio = block.get("audio_text") not in ["[No localized audio]", "", "[None]"]
@@ -564,7 +575,6 @@ def phase4_data_merger(ocr_timeline: list, zh_data: list, diarization_data: list
         env_len = len(block["ocr_env"]) if has_env else 0
         max_text_len = max(sub_len, env_len)
         
-        # Kill it if it's < 3 chars, has no audio, AND wasn't saved by our 9x6 grid whitelist
         is_suspicious_garbage = (not has_audio) and (max_text_len < 3) and (not block.get("is_protected", False))
         
         if is_suspicious_garbage:
