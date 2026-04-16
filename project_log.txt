@@ -1,0 +1,28 @@
+======================================================================
+BLAZING TEENS S1 - PROJECT DEV LOG
+======================================================================
+
+DATE: 2026-04-16
+STATUS: 13 Episodes Completed
+
+[PIPELINE PROGRESS]
+The pipeline for extracting Chinese audio and OCR is working well.
+Subtitles occasionally bleed into each other, which is a minor issue.
+The system also misses some micro-reactions at times during the sweeps.
+Post-pipeline translation and formatting is still a rough manual grind.
+Stitching the DeepSeek and Gemini outputs together takes a lot of time.
+The goal is to automate this to a high standard by the end.
+
+[LORE & CONSISTENCY]
+I am finally understanding the plot and learning the actual character names.
+Popcorn is officially Monica, Chen Hao appears to be Jacky but leaving it as is till I confirm.
+I need to go back to earlier episodes and do a retro-pass.
+I will refine the names and ensure consistency for yo-yos and moves.
+
+[TECHNICAL HURDLES]
+We hit a massive error with Episode 10 being physically corrupted.
+OpenCV kept crashing, even though VLC media player played it perfectly.
+VLC was just hiding the broken frames and smoothing over the errors.
+We had to change the formatting of the episode to ensure it was read.
+Used an ffmpeg 'car wash' command to completely rebuild the video index.
+After the wash, the pipeline swept the episode perfectly without crashing.
