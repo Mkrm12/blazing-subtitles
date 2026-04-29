@@ -26,3 +26,59 @@ VLC was just hiding the broken frames and smoothing over the errors.
 We had to change the formatting of the episode to ensure it was read.
 Used an ffmpeg 'car wash' command to completely rebuild the video index.
 After the wash, the pipeline swept the episode perfectly without crashing.
+
+
+======================================================================
+
+
+DATE: 2026-04-21
+STATUS: 20 Episodes Completed (50% Milestone)
+
+[PIPELINE PROGRESS]
+All 40 episodes have now been successfully scrubbed and processed.
+Initial translations are complete for 20 episodes, hitting the halfway point.
+Added pipeline2.py to fully automate the extraction process.
+Instead of running episodes one by one, it now batch processes the data folder.
+It automatically applies the ffmpeg 'car wash' and outputs cleanly into folders.
+Added stitcher.py — The Ultimate SRT Refiner, Multi-Line Parser & Clash Detector.
+This script helps auto-check my post-LLM subtitle refinements.
+It auto-formats custom shorthands and mathematically flags any timecode clashes.
+
+[LLM EXPERIMENTATION]
+Explored automating the post-scrubbing and translation pipeline via API.
+Tested both the Qwen and Gemini APIs to handle the heavy lifting.
+Ultimately determined that the current LLM prompt-based setup yields way better results.
+
+[LORE & CONSISTENCY]
+As I watch more episodes, I am gathering much more context on the story.
+I will leave finalizing character names and yo-yo terms until the very end.
+I need to refine names based on context (e.g., using "Meatball" vs "Song Yuan").
+Eventually, I need to lock in all character cards, yo-yo names, and yo-yo moves.
+
+[BACKLOG & FUTURE POLISH]
+Add episode numbers to all output files.
+Write a comprehensive README explaining how to use the tools and pipelines.
+
+
+DATE: 2026-04-29
+STATUS: 40 Episodes Completed (100% Translation Milestone)
+
+[PIPELINE & TOOLING PROGRESS]
+All 40 episodes are finally translated! A massive accomplishment and an incredible feeling.
+Built a "Florence Cleaner" script for Episode 30 onwards. It surgically cuts the Florence-2 visual descriptions down to a single line. The massive paragraphs were eating up memory, lengthening wait times, and providing useless context. The cleaner fixed this instantly.
+One major retrospective takeaway: batch-scraping all remaining episodes around Ep 20 saved time, but it killed the iterative pipeline. I couldn't make micro-improvements to the extraction script for the later episodes.
+
+[LLM SYNERGY & TRANSLATION]
+Encountered serious memory limits with DeepSeek. During Ep 28, the chat context maxed out, and switching to a new chat caused a noticeable drop in translation quality for Part 2.
+Pivoted to a dual-LLM tag-team approach: DeepSeek + Gemini.
+DeepSeek handles the blunt, highly accurate structural translation, and Gemini does the rewording. Gemini smooths out the flow beautifully—it can be a bit dramatic sometimes, but it yielded a massive improvement in writing quality.
+The final 3 tournament episodes had intense on-screen text and signs that heavily interfered with the pipeline. The pipeline couldn't filter it natively, but the DeepSeek + Gemini combo managed to power through and filter the noise.
+
+[RETROSPECTIVE & NEXT STEPS]
+Because of the evolving pipeline and my growing understanding of the show, the later episodes are noticeably higher quality than the earlier ones.
+Realized I didn't run stitcher.py on some of the early episodes, meaning there are almost certainly raw timestamp clashes and errors hiding in them.
+The next 7 days will be pure refinement and deployment prep.
+Need to conduct deep research on all character names, catchphrases, and yo-yo move names.
+Must do a global consistency sweep to fix move names across all 40 files and append official episode numbers.
+
+======================================================================
