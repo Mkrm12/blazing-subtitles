@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Blazing Subtitles Pipeline Player</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #121212;
+            color: #ffffff;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding-top: 40px;
+            margin: 0;
+            padding-bottom: 50px;
+        }
+
+        /* Split Upload Area */
+        #uploadContainer {
+            display: flex;
+            gap: 20px;
+            width: 85vw;
+            max-width: 900px;
+            margin-bottom: 20px;
+        }
+
+        .dropzone {
+            flex: 1;
+            padding: 40px 20px;
+            border: 3px dashed #555;
+            border-radius: 12px;
+            text-align: center;
+            background: #1e1e1e;
+            transition: all 0.2s ease;
+            cursor: pointer;
+        }
+
+        .dropzone.dragover {
+            border-color: #00ffcc;
+            background: #2a2a2a;
+            transform: scale(1.02);
+        }
+
+        .dropzone p { margin: 0; font-size: 1.1rem; color: #aaa; pointer-events: none; }
+        .dropzone span { display: block; font-size: 0.8rem; margin-top: 8px; color: #777; }
+        .dropzone.loaded { border-color: #4CAF50; background: #1a2a1a; }
+        
+        input[type="file"] { display: none; }
+
+        /* Custom Player Container */
+        #playerContainer {
+            position: relative;
+            width: 90vw;
+            max-width: 1200px;
+            display: none; 
+            background: #000;
+            border: 2px solid #333;
+            border-radius: 8px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            overflow: hidden;
+        }
+
+        #playerContainer:fullscreen { max-width: none; width: 100vw; height: 100vh; border: none; border-radius: 0; }
+        #playerContainer:-webkit-full-screen { max-width: none; width: 100vw; height: 100vh; border: none; border-radius: 0; }
+
+        video {
+            width: 100%;
+            height: 100%;
+            max-height: 80vh;
+            display: block;
+            object-fit: contain;
+        }
+
+        /* Bottom Controls Bar */
+        #controlsBar {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            background: linear-gradient(transparent, rgba(0,0,0,0.95));
+            padding: 30px 20px 15px 20px;
+            box-sizing: border-box;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+
+        #playerContainer:hover #controlsBar, #playerContainer:fullscreen #controlsBar {
+            opacity: 1;
+        }
+
+        button.control-btn {
+            background: none;
+            border: none;
+            color: white;
+            font-size: 1.4rem;
+            cursor: pointer;
+            outline: none;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        button.control-btn:hover { color: #00ffcc; }
+
+        #timeDisplay {
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 1rem;
+            color: #00ffcc;
+            white-space: nowrap;
+        }
+
+        /* Timeline Wrapper */
+        #timelineWrapper {
+            position: relative;
+            flex-grow: 1;
+            display: flex;
+            align-items: center;
+        }
+
+        input[type=range] {
+            -webkit-appearance: none;
+            width: 100%;
+            background: transparent;
+            cursor: pointer;
+        }
+
+        input[type=range]::-webkit-slider-runnable-track {
+            width: 100%;
+            height: 6px;
+            background: rgba(255, 255, 255, 0.3);
+            border-radius: 3px;
+        }
+
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            height: 14px;
+            width: 14px;
+            border-radius: 50%;
+            background: #00ffcc;
+            margin-top: -4px;
+        }
+
+        #hoverTooltip {
+            position: absolute;
+            bottom: 25px;
+            background: #111;
+            color: white;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 12px;
+            border: 1px solid #444;
+            transform: translateX(-50%);
+            display: none;
+            pointer-events: none;
+            white-space: nowrap;
+        }
+
+        ::cue {
+            background-color: rgba(0, 0, 0, 0.85);
+            color: #fff;
+            font-size: 1.6rem;
+            font-family: 'Segoe UI', sans-serif;
+            text-shadow: 2px 2px 2px #000;
+        }
+
+        /* Summary Description Box */
+        #pipelineDesc {
+            width: 90vw;
+            max-width: 1200px;
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 25px 30px;
+            margin-top: 20px;
+            box-sizing: border-box;
+            display: none;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+        }
+
+        #pipelineDesc h3 { margin-top: 0; color: #00ffcc; border-bottom: 1px solid #333; padding-bottom: 10px; font-weight: 600; }
+        #pipelineDesc ul { list-style-type: none; padding: 0; margin: 0; color: #aaa; line-height: 2; font-size: 1.05rem; }
+        #pipelineDesc li { border-left: 3px solid #00ffcc; padding-left: 15px; margin-bottom: 8px; background: rgba(0, 255, 204, 0.03); border-radius: 0 4px 4px 0; }
+        #pipelineDesc li strong { color: #fff; letter-spacing: 0.5px; }
+    </style>
+</head>
+<body>
+
+    <div id="uploadContainer">
+        <div id="vidDrop" class="dropzone">
+            <p>📁 1. Drop Video</p>
+            <span>(.mp4, .webm)</span>
+        </div>
+        <div id="subDrop" class="dropzone">
+            <p>📝 2. Drop Subtitles</p>
+            <span>(.srt, .vtt)</span>
+        </div>
+        <input type="file" id="vidInput" accept="video/*">
+        <input type="file" id="subInput" accept=".srt,.vtt">
+    </div>
+
+    <div id="playerContainer">
+        <video id="videoPlayer"></video>
+        
+        <div id="controlsBar">
+            <button class="control-btn" id="playPauseBtn">▶</button>
+            <div id="timeDisplay">00:00:00.000</div>
+            
+            <div id="timelineWrapper">
+                <div id="hoverTooltip">00:00:00.000</div>
+                <input type="range" id="timeline" value="0" step="0.001">
+            </div>
+
+            <button class="control-btn" id="fullscreenBtn">⛶</button>
+        </div>
+    </div>
+
+    <div id="pipelineDesc">
+        <h3>🔥🪀 Blazing Subtitles Pipeline - Active Run</h3>
+        <ul>
+            <li><strong>Audio Extraction:</strong> Whisper (NLP Deduplication)</li>
+            <li><strong>Speaker Diarization:</strong> Pyannote Array</li>
+            <li><strong>Visual Sweeping:</strong> Dual-Box OCR Master Clock (EasyOCR + PaddleOCR)</li>
+            <li><strong>Contextual Engine:</strong> Florence-2 Visual Descriptions</li>
+            <li><strong>Translation Target:</strong> DeepSeek Batch Translation Node</li>
+        </ul>
+    </div>
+
+    <script>
+        const vidDrop = document.getElementById('vidDrop');
+        const subDrop = document.getElementById('subDrop');
+        const vidInput = document.getElementById('vidInput');
+        const subInput = document.getElementById('subInput');
+        
+        const playerContainer = document.getElementById('playerContainer');
+        const videoPlayer = document.getElementById('videoPlayer');
+        const pipelineDesc = document.getElementById('pipelineDesc');
+        
+        const playPauseBtn = document.getElementById('playPauseBtn');
+        const timeDisplay = document.getElementById('timeDisplay');
+        const timeline = document.getElementById('timeline');
+        const hoverTooltip = document.getElementById('hoverTooltip');
+        const fullscreenBtn = document.getElementById('fullscreenBtn');
+        
+        let currentVideoURL = null;
+        let currentSubURL = null;
+
+        // --- Drag & Drop Setup ---
+        function setupDropzone(dropzone, input, handler) {
+            dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
+            dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+            dropzone.addEventListener('drop', (e) => {
+                e.preventDefault();
+                dropzone.classList.remove('dragover');
+                if (e.dataTransfer.files.length > 0) handler(e.dataTransfer.files[0]);
+            });
+            dropzone.addEventListener('click', () => input.click());
+            input.addEventListener('change', (e) => {
+                if (e.target.files.length > 0) handler(e.target.files[0]);
+            });
+        }
+
+        function handleVideo(file) {
+            if (!file.type.startsWith('video/')) return alert('Please drop a valid video file.');
+            if (currentVideoURL) URL.revokeObjectURL(currentVideoURL);
+            
+            currentVideoURL = URL.createObjectURL(file);
+            videoPlayer.src = currentVideoURL;
+            
+            vidDrop.classList.add('loaded');
+            vidDrop.querySelector('p').textContent = '✅ Video Loaded';
+            
+            playerContainer.style.display = 'block';
+            pipelineDesc.style.display = 'block';
+            
+            attachSubtitles();
+        }
+
+        function handleSubtitle(file) {
+            if (!file.name.endsWith('.srt') && !file.name.endsWith('.vtt')) return alert('Must be .srt or .vtt');
+            
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                let text = e.target.result;
+                
+                if (file.name.endsWith('.srt')) {
+                    text = 'WEBVTT\n\n' + text.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
+                } else if (!text.startsWith('WEBVTT')) {
+                    text = 'WEBVTT\n\n' + text; 
+                }
+
+                const lines = text.split('\n');
+                for (let i = 0; i < lines.length; i++) {
+                    if (lines[i].includes('-->')) {
+                        const parts = lines[i].split('-->');
+                        const start = parts[0].trim();
+                        const end = parts[1].trim().split(' ')[0];
+                        lines[i] = `${start} --> ${end} line:95% align:center`;
+                    }
+                }
+                
+                const blob = new Blob([lines.join('\n')], { type: 'text/vtt' });
+                
+                if (currentSubURL) URL.revokeObjectURL(currentSubURL);
+                currentSubURL = URL.createObjectURL(blob);
+                
+                subDrop.classList.add('loaded');
+                subDrop.querySelector('p').textContent = '✅ Subs Loaded';
+                
+                attachSubtitles();
+            };
+            reader.readAsText(file);
+        }
+
+        function attachSubtitles() {
+            if (!currentSubURL || !currentVideoURL) return;
+            videoPlayer.querySelectorAll('track').forEach(t => t.remove());
+            const track = document.createElement('track');
+            track.kind = 'subtitles';
+            track.label = 'English Extraction';
+            track.srclang = 'en';
+            track.default = true;
+            track.src = currentSubURL;
+            videoPlayer.appendChild(track);
+        }
+
+        setupDropzone(vidDrop, vidInput, handleVideo);
+        setupDropzone(subDrop, subInput, handleSubtitle);
+
+        // --- Custom Controls UI ---
+        function togglePlay() {
+            if (videoPlayer.paused) {
+                videoPlayer.play();
+                playPauseBtn.textContent = '⏸';
+            } else {
+                videoPlayer.pause();
+                playPauseBtn.textContent = '▶';
+            }
+        }
+
+        playPauseBtn.addEventListener('click', togglePlay);
+        videoPlayer.addEventListener('click', togglePlay);
+
+        videoPlayer.addEventListener('loadedmetadata', () => { timeline.max = videoPlayer.duration; });
+        timeline.addEventListener('input', () => { videoPlayer.currentTime = timeline.value; });
+
+        timeline.addEventListener('mousemove', (e) => {
+            const rect = timeline.getBoundingClientRect();
+            const pos = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+            const hoverTime = pos * (videoPlayer.duration || 0);
+            
+            hoverTooltip.textContent = formatTime(hoverTime);
+            hoverTooltip.style.left = `${e.clientX - rect.left}px`;
+            hoverTooltip.style.display = 'block';
+        });
+        timeline.addEventListener('mouseleave', () => hoverTooltip.style.display = 'none');
+
+        fullscreenBtn.addEventListener('click', () => {
+            if (!document.fullscreenElement) {
+                if (playerContainer.requestFullscreen) playerContainer.requestFullscreen();
+                else if (playerContainer.webkitRequestFullscreen) playerContainer.webkitRequestFullscreen();
+            } else {
+                if (document.exitFullscreen) document.exitFullscreen();
+                else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+            }
+        });
+
+        // --- High-Speed Formatter Loop ---
+        function formatTime(totalSeconds) {
+            if (isNaN(totalSeconds)) return "00:00:00.000";
+            const h = Math.floor(totalSeconds / 3600);
+            const m = Math.floor((totalSeconds % 3600) / 60);
+            const s = Math.floor(totalSeconds % 60);
+            const ms = Math.floor((totalSeconds - Math.floor(totalSeconds)) * 1000);
+            return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}.${ms.toString().padStart(3, '0')}`;
+        }
+
+        function updateLoop() {
+            if (videoPlayer.readyState > 0) {
+                timeDisplay.textContent = formatTime(videoPlayer.currentTime);
+                if (document.activeElement !== timeline) timeline.value = videoPlayer.currentTime;
+            }
+            requestAnimationFrame(updateLoop);
+        }
+        updateLoop();
+
+        // --- ⌨️ KEYBOARD COMMAND CENTER ⌨️ ---
+        document.addEventListener('keydown', (e) => {
+            // Do nothing if no video is loaded yet
+            if (!currentVideoURL) return;
+
+            switch(e.code) {
+                case 'Space':
+                    e.preventDefault(); // Kills the page scroll instantly
+                    togglePlay();
+                    break;
+                case 'ArrowRight':
+                    e.preventDefault(); // Kills side-scrolling
+                    videoPlayer.currentTime = Math.min(videoPlayer.duration, videoPlayer.currentTime + 3);
+                    break;
+                case 'ArrowLeft':
+                    e.preventDefault();
+                    videoPlayer.currentTime = Math.max(0, videoPlayer.currentTime - 3);
+                    break;
+            }
+        });
+    </script>
+</body>
+</html>
